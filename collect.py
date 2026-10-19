@@ -89,9 +89,26 @@ def collect_yahoo():
         time.sleep(0.4)
 
 
+CNN_H = dict(UA, **{"Origin": "https://edition.cnn.com", "Referer": "https://edition.cnn.com/",
+                    "Accept-Language": "en-US,en;q=0.9"})
+
+
+def get_h(url, headers, tries=2):
+    err = None
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            err = e
+            time.sleep(2 * (i + 1))
+    raise err
+
+
 def collect_fng():
     try:
-        d = get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata")
+        # CNN 은 Origin/Referer 머리글이 없으면 거절(418)한다
+        d = get_h("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", CNN_H)
         f = d["fear_and_greed"]
         hist = []
         for p in (d.get("fear_and_greed_historical") or {}).get("data", []):
@@ -128,21 +145,105 @@ def collect_vkospi():
         OUT["errors"]["vkospi"] = str(e)[:200]
 
 
-def probe_krx():
-    """야간선물용 — 접속 가능 여부만 기록(다음 단계에서 수집 방식 결정)."""
+# ---------------- KRX 정보데이터시스템 — 코스피200 선물 주간·야간 (로그인 필요)
+# 아이디·비밀번호는 깃허브 저장소 Settings → Secrets 의 KRX_ID / KRX_PW 로만 받는다(파일·로그에 남기지 않음).
+import http.cookiejar
+KRX_UA = UA["User-Agent"]
+KRX_JSON = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_REF = "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020202"
+KRX_LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+KRX_LOGIN_JSP = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+KRX_LOGIN = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+_krx = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+
+def krx_login():
+    kid, kpw = os.environ.get("KRX_ID", ""), os.environ.get("KRX_PW", "")
+    if not kid or not kpw:
+        raise RuntimeError("KRX_ID/KRX_PW 시크릿 없음")
+    for url, ref in ((KRX_LOGIN_PAGE, None), (KRX_LOGIN_JSP, KRX_LOGIN_PAGE)):
+        h = {"User-Agent": KRX_UA}
+        if ref:
+            h["Referer"] = ref
+        with _krx.open(urllib.request.Request(url, headers=h), timeout=20) as r:
+            r.read()
+
+    def post(skip=False):
+        p = {"mbrNm": "", "telNo": "", "di": "", "certType": "", "mbrId": kid, "pw": kpw}
+        if skip:
+            p["skipDup"] = "Y"
+        req = urllib.request.Request(KRX_LOGIN, data=urllib.parse.urlencode(p).encode(), method="POST",
+                                     headers={"User-Agent": KRX_UA, "Referer": KRX_LOGIN_PAGE,
+                                              "Content-Type": "application/x-www-form-urlencoded"})
+        with _krx.open(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    res = post()
+    if res.get("_error_code") == "CD011":  # 중복 로그인
+        res = post(True)
+    if res.get("_error_code") != "CD001":
+        raise RuntimeError("KRX 로그인 실패 " + str(res.get("_error_code")))
+
+
+def krx_post(data):
+    req = urllib.request.Request(KRX_JSON, data=urllib.parse.urlencode(data).encode(), method="POST",
+                                 headers={"User-Agent": KRX_UA, "Referer": KRX_REF, "X-Requested-With": "XMLHttpRequest",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    with _krx.open(req, timeout=40) as r:
+        raw = r.read().decode("utf-8", "replace")
+    if not raw.lstrip().startswith("{"):
+        raise RuntimeError("KRX 비JSON 응답 " + raw[:40])
+    p = json.loads(raw)
+    return p.get("OutBlock_1") or p.get("output") or []
+
+
+def collect_night():
     try:
-        req = urllib.request.Request("https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd", headers=UA)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            OUT["krx_probe"] = r.status
+        krx_login()
+        now = datetime.now(KST)
+        rows = krx_post({"bld": "dbms/MDC/STAT/standard/MDCSTAT12701", "locale": "ko_KR", "prodId": "KR___FUK2I",
+                         "strtDd": (now - timedelta(days=100)).strftime("%Y%m%d"), "endDd": now.strftime("%Y%m%d"),
+                         "aggBasTpCd": "", "share": "1", "money": "3", "csvxls_isNo": "false"})
+
+        def pack(r):
+            cl, chg = num(r.get("TDD_CLSPRC")), num(r.get("CMPPREVDD_PRC"))
+            if not cl or chg is None:
+                return None
+            if str(r.get("FLUC_TP_CD")) == "2" and chg > 0:
+                chg = -chg
+            base = cl - chg
+            return {"d": str(r.get("TRD_DD", ""))[:10].replace("/", "-"), "c": cl, "chg": chg,
+                    "pct": round(chg / base * 100, 2) if base else None, "o": num(r.get("TDD_OPNPRC")),
+                    "h": num(r.get("TDD_HGPRC")), "l": num(r.get("TDD_LWPRC")), "vol": num(r.get("ACC_TRDVOL")),
+                    "name": str(r.get("ISU_NM", "")).strip()}
+        night = day = None
+        hist = []
+        for r in rows:
+            lab = str(r.get("TRD_DD", ""))
+            x = pack(r)
+            if not x:
+                continue
+            if night is None and "(야간)" in lab:
+                night = x
+            if day is None and "(주간)" in lab:
+                day = x
+            if len(hist) < 160:
+                h = {k: x[k] for k in ("d", "c", "chg", "pct", "h", "l", "vol")}
+                h["s"] = "야간" if "(야간)" in lab else "주간"
+                hist.append(h)
+        if not night:
+            raise RuntimeError(f"야간 행 없음(받은 행 {len(rows)})")
+        OUT["night"] = {"night": night, "day": day, "hist": hist,
+                        "src": "KRX 정보데이터시스템 [15003] 최근월물 시세 추이(선물)",
+                        "fetched": now.strftime("%Y-%m-%dT%H:%M+09:00")}
     except Exception as e:
-        OUT["errors"]["krx_probe"] = str(e)[:200]
+        OUT["errors"]["night"] = (type(e).__name__ + ": " + str(e))[:200]
 
 
 if __name__ == "__main__":
     collect_fng()
     collect_vkospi()
     collect_yahoo()
-    probe_krx()
+    collect_night()
     os.makedirs("data", exist_ok=True)
     with open("data/latest.json", "w", encoding="utf-8") as f:
         json.dump(OUT, f, ensure_ascii=False, separators=(",", ":"))
