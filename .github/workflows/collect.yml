@@ -2,9 +2,11 @@ name: collect
 
 on:
   schedule:
-    - cron: "5 21 * * 1-5"   # 한국시간 화~토 06:05 (미국장 마감 후)
-    - cron: "5 7 * * 1-5"    # 한국시간 월~금 16:05 (한국장 마감 후)
-  workflow_dispatch: {}      # Actions 화면에서 직접 실행 가능
+    - cron: "15 21 * * 1-5"   # 한국시간 화~토 06:15 (야간 세션 끝난 뒤)
+    - cron: "40 23 * * 0-4"   # 한국시간 월~금 08:40 (개장 직전)
+    - cron: "35 6 * * 1-5"    # 한국시간 월~금 15:35 (주간 장 마감 직후)
+    - cron: "30 13 * * 1-5"   # 한국시간 월~금 22:30 (미국장 초반·야간장 진행 중)
+  workflow_dispatch: {}       # Actions 화면에서 직접 실행 가능
 
 permissions:
   contents: write
@@ -19,6 +21,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Collect
+        env:
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
         run: python collect.py
       - name: Save
         run: |
@@ -26,4 +31,5 @@ jobs:
           git config user.email "balvip-bot@users.noreply.github.com"
           git add data/latest.json
           git diff --cached --quiet || git commit -m "data $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase
           git push
